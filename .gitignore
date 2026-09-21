@@ -1,0 +1,9 @@
+# 场景样产物（保留给本机构建，不入库）
+build/
+dist/
+*.spec
+__pycache__/
+
+# 用户本地配置/校准（含热键、坐标区域、分辨率，不入库）
+config.json
+_calib_preview.png
