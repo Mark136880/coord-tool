@@ -1,5 +1,14 @@
 # 坐标距离计算（War Dogs · L81 迫击炮辅助）
 
+![license](https://img.shields.io/badge/license-MIT-green)
+![platform](https://img.shields.io/badge/platform-Windows-blue)
+![python](https://img.shields.io/badge/python-3.14-blue)
+![language](https://img.shields.io/badge/language-Python-yellow)
+![status](https://img.shields.io/badge/status-stable-brightgreen)
+
+> 🔓 **开源协议：MIT License** —— 免费、开放源代码，可自由查看、修改、二次分发。
+> 本项目完全**离线、安全**：不读游戏内存、无键盘钩子、无任何网络上报。
+
 一个离线、安全的战术坐标辅助悬浮工具，为 War Dogs 的 L81 迫击炮 / 跳蛋炮（M79-L81 系列）提供坐标、距离、方位计算与瞄具刻度对准。
 
 ## 📥 下载
