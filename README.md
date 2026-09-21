@@ -2,6 +2,15 @@
 
 一个离线、安全的战术坐标辅助悬浮工具，为 War Dogs 的 L81 迫击炮 / 跳蛋炮（M79-L81 系列）提供坐标、距离、方位计算与瞄具刻度对准。
 
+## 📥 下载
+
+| 入口 | 链接 |
+|---|---|
+| 🏷️ 下载页（全部版本） | https://github.com/Mark136880/coord-tool/releases |
+| ⬇️ 最新安装包直链 | [CoordTool-Setup-v1.0.exe](https://github.com/Mark136880/coord-tool/releases/download/v1.0/CoordTool-Setup-v1.0.exe) |
+
+> 安装包内置便携版 OCR，**免装 Tesseract**，可全程离线运行。
+
 ## 特性
 
 - **坐标识别**：悬停在地图坐标上，按快捷键自动截屏 OCR 读取 x/y
