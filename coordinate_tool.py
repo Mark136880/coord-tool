@@ -74,6 +74,14 @@ DEFAULT_CONFIG = {
                 "correction": 1.0,      # 高度差修正系数(目标更高时需要更大刻度,系数为正)
                 "y_flip": True,         # 游戏 Y 与高度网格行是否反向
                 "unit_to_meter": 6.25}, # 游戏世界单位 -> 米的水平比例(从包内 coverage 推出)
+    # 语音播报:调 Windows 自带 SAPI,零依赖、离线。发音在后台线程,不影响计算/UI。
+    "voice": {"enabled": True,           # 总开关
+              "style": "soldier",        # 风格:soldier=中文士兵战场口令,empty=原样读
+              "result": True,            # 播最终结果(距离/方位)
+              "coords": False,           # 播自点/目标坐标
+              "error": True,             # 识别失败时播报
+              "rate": 0,                 # SAPI 语速(-10~10),默认 0 正常
+              "voice": ""},              # 发音人名(空=系统默认;可选女/男声)
 }
 
 
@@ -91,6 +99,7 @@ def load_config():
             merged["reticle_line"] = {**DEFAULT_CONFIG["reticle_line"],
                                       **(cfg.get("reticle_line") or {})}
             merged["terrain"] = {**DEFAULT_CONFIG["terrain"], **(cfg.get("terrain") or {})}
+            merged["voice"] = {**DEFAULT_CONFIG["voice"], **(cfg.get("voice") or {})}
             return merged
     return dict(DEFAULT_CONFIG)
 
@@ -322,6 +331,115 @@ def calc(p1, p2, scale):
     if bearing < 0:
         bearing += 360
     return d_unit, d_meter, bearing
+
+
+# ============================================================
+# 语音播报:调 Windows 自带语音(零 Python 依赖、离线、打包体积不变)
+# ------------------------------------------------------------
+# speak() 只往队列塞一条消息,真正发音在后台线程做(SAPI/System.Speech),
+# 绝不阻塞 UI 线程,也不增加坐标/距离计算耗时(计算是同步的,语音是异步的)。
+# ============================================================
+class VoiceAnnouncer:
+    def __init__(self, text_fn=None, voice_name="", rate=0):
+        """text_fn(text) -> 最终播报词(可加风格前缀)。不给则原样播。
+        voice_name: 指定发音人(System.Speech 名称,空=系统默认);rate: 语速(-10~10)。"""
+        self.q = queue.Queue()
+        self._text_fn = text_fn or (lambda t: t)
+        self._voice_name = voice_name or ""
+        self._rate = rate
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        """后台线程:队列里逐条取出,用系统语音发声。不进 UI 线程,不影响计算。"""
+        while True:
+            text = self.q.get()
+            if text is None:
+                break
+            try:
+                self._say(text)
+            except Exception:
+                pass
+
+    def _say(self, text):
+        if not text:
+            return
+        import subprocess
+        # 通过环境变量传文本,避开引号/中文转义问题;用 System.Speech 离线发声。
+        # 只占一个后台 daemon 线程,计算/UI 完全不受影响。
+        sel = ""
+        if self._voice_name:
+            # 语音名含引号/空格,用 SelectVoice 前先按名称匹配,失败自动回落默认
+            sel = ("try { $s.SelectVoice('%s') } catch {} ;" % self._voice_name.replace("'", "''"))
+        rate = "try { $s.Rate = %d } catch {} ;" % int(self._rate)
+        ps = ("Add-Type -AssemblyName System.Speech;"
+              "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+              + sel + rate +
+              "$s.Volume = 100;"
+              "$s.Speak($env:COORDVOICE)")
+        enc = os.environ.copy()
+        enc["COORDVOICE"] = self._text_fn(text)
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                       env=enc, creationflags=0x08000000,  # CREATE_NO_WINDOW
+                       timeout=20, check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def speak(self, text):
+        """非阻塞:只入队。返回立即,计算/UI 不受影响。"""
+        try:
+            self.q.put_nowait(text)
+        except Exception:
+            pass
+
+
+def list_install_voices():
+    """枚举系统已安装的语音,返回 [(发音人名, 性别 女/男/未知), ...]。
+    离线、单次调用;失败时返回空列表(仅影响发音人下拉,不影响其它功能)。"""
+    import subprocess
+    ps = ("Add-Type -AssemblyName System.Speech;"
+          "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+          "$s.GetInstalledVoices() | ForEach-Object { $a=$_.VoiceInfo; "
+          "Write-Output ($a.Name + '|' + $a.Gender) }")
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           capture_output=True, creationflags=0x08000000, timeout=15)
+    except Exception:
+        return []
+    # 中文系统控制台默认 GBK,直接 text=True 会 UnicodeDecodeError,这里先解码再容错
+    try:
+        raw = r.stdout.decode("utf-8")
+    except Exception:
+        try:
+            raw = r.stdout.decode("gbk")
+        except Exception:
+            raw = r.stdout.decode("utf-8", "ignore")
+    res = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if "|" not in line:
+            continue
+        nm, g = line.rsplit("|", 1)
+        nm = nm.strip()
+        if not nm:
+            continue
+        if "emale" in g:
+            gender = "女"
+        elif "ale" in g:
+            gender = "男"
+        else:
+            gender = "未知"
+        res.append((nm, gender))
+    return res
+
+
+def title_voice(text):
+    """中文士兵战场风格:用军事术语精简整句,去除单位罗嗦,醒目简洁。"""
+    if not text:
+        return text
+    s = text.strip()
+    # 常见句式的口水词去掉,换成战场口令口吻
+    s = s.replace("米，方位", "米,方位")
+    s = s.replace(" 米", "米").replace(" 度", "度")
+    return s
 
 
 # ============================================================
@@ -755,6 +873,10 @@ class OverlayApp:
         if (cfg.get("reticle_line") or {}).get("enabled"):
             self.ref_line.show()
 
+        # 语音播报:后台线程发音,不阻塞计算/UI。只在总开关开启时才建队列。
+        self._last_spoken = ()      # 去重:同一 (距离,方位) 不重复播
+        self._init_voice()
+
         self._on_close = False
 
     # ---------- UI ----------
@@ -907,27 +1029,27 @@ class OverlayApp:
             tk.Frame(self._row_kpi, bg=divider, width=1, height=48).grid(
                 row=0, column=1, rowspan=2, padx=14, sticky="ns")
 
-            # ---------- 自点 / 目标(等宽小字) ----------
+            # ---------- 自点 / 目标(等宽小字) + 高程徽标(同排,省一行的窗口高度) ----------
             self._row_pts = tk.Frame(self._content, bg=bg)
             self._row_pts.pack(fill="x", padx=10, pady=(2, 2))
+            self._row_pts.columnconfigure(0, weight=1)
+            self._row_pts.columnconfigure(1, weight=0)
             self.lbl_self = tk.Label(self._row_pts, text="自点 --", bg=bg, fg=fg,
                                      font=mono_small, anchor="w")
-            self.lbl_self.pack(side="left")
+            self.lbl_self.grid(row=0, column=0, sticky="w")
             self.lbl_target = tk.Label(self._row_pts, text="目标 --", bg=bg, fg=fg,
                                        font=mono_small, anchor="e")
-            self.lbl_target.pack(side="right")
+            self.lbl_target.grid(row=0, column=1, sticky="e")
+            self.lbl_alt = tk.Label(self._row_pts, text="Δ高 --", bg=badge_bg, fg=orange,
+                                    font=("Microsoft YaHei UI", 8, "bold"), padx=6, pady=1)
+            self.lbl_alt.grid(row=0, column=2, sticky="e", padx=(8, 0))
 
-            # ---------- 状态行:高程徽标(左) + 状态文字(右) ----------
+            # ---------- 状态行(仅状态文字) ----------
             self._row_status = tk.Frame(self._content, bg=bg)
             self._row_status.pack(fill="x", padx=10, pady=(2, 2))
-            self.lbl_alt = tk.Label(self._row_status, text="Δ高 --", bg=badge_bg, fg=orange,
-                                    font=("Microsoft YaHei UI", 8, "bold"), padx=7, pady=1,
-                                    anchor="w")
-            self.lbl_alt.pack(side="left")
-            self.lbl_status = tk.Label(self._row_status, text="就绪", bg=bg, fg=sub,
-                                       font=("Microsoft YaHei UI", 9), anchor="w",
+            self.lbl_status = tk.Label(self._row_status, text="就绪", bg=bg, fg=sub, anchor="w",
                                        justify="left")
-            self.lbl_status.pack(side="left", padx=(8, 0))
+            self.lbl_status.pack(fill="x")
 
             # ---------- 地图行 ----------
             tg = self.cfg.setdefault("terrain", {})
@@ -1082,10 +1204,14 @@ class OverlayApp:
         x, y, ok = read_coordinate(self.cfg, save_preview_to=preview)
         if not ok:
             self._log("识别失败")
+            if self.announcer is not None and self.cfg["voice"].get("error"):
+                self.announcer.speak("识别失败,请重试")
             return
         self._log(f"识别到 x={x} y={y}")
         if slot == "self":
             self.self_pos = (x, y)
+            if self.announcer is not None and self.cfg["voice"].get("coords"):
+                self.announcer.speak("自点,东%.2f北%.2f" % (x, y))
         else:
             self.target_pos = (x, y)
         # 距离/方位和刻度尺线立刻画出来(用的是内置实测刻度表,不用等识别),
@@ -1182,6 +1308,13 @@ class OverlayApp:
             else:
                 self._log("目标 %.0f 米 -> 在 %dM 和 %dM 之间,按绿线位置对准准星中心(约 %dM)"
                           % (eff, lo, hi, mid))
+
+            # 语音播报最终结果(非阻塞、同值去重):"距离X米方位X度"
+            if self.announcer is not None and (self.cfg["voice"].get("result")):
+                key = (round(eff), round(bearing * 10))
+                if key != self._last_spoken:
+                    self._last_spoken = key
+                    self.announcer.speak("距离%d米,方位%.1f度" % (round(eff), bearing))
         else:
             self.lbl_dist.config(text="距离: --")
             self.lbl_bear.config(text="方位: --")
@@ -1232,6 +1365,16 @@ class OverlayApp:
             t.after(ms, t.destroy)
         except Exception:
             pass
+
+    def _init_voice(self):
+        """按当前配置创建/停用语音播报器(开关从设置保存后调用)。"""
+        vc = self.cfg.get("voice") or {}
+        self.announcer = None           # 先停旧的(旧线程是 daemon,自然回收)
+        if vc.get("enabled"):
+            fn = title_voice if vc.get("style") == "soldier" else None
+            self.announcer = VoiceAnnouncer(text_fn=fn,
+                                            voice_name=vc.get("voice", "") or "",
+                                            rate=vc.get("rate", 0) or 0)
 
     def toggle_ref_line(self):
         rl = self.cfg.setdefault("reticle_line", {})
@@ -1511,6 +1654,73 @@ class OverlayApp:
                    "y_flip={}. 填错会读到相反位置的海拔,发射有误就反一下。".format(tg.get("y_flip", True)),
                  bg="#171a1f", fg="#9aa0a6", font=("Microsoft YaHei UI", 8), justify="left").pack(**pad)
 
+        # ---- 语音播报 ----
+        vg = self.cfg.setdefault("voice", {})
+        f_voice = tk.LabelFrame(win, text="语音播报(中文士兵战场风格)", bg="#171a1f", fg="#34d399",
+                                font=("Microsoft YaHei UI", 9), bd=0)
+        f_voice.pack(fill="x", padx=8, pady=6)
+        v_v_en = tk.BooleanVar(value=bool(vg.get("enabled", True)))
+        v_v_result = tk.BooleanVar(value=bool(vg.get("result", True)))
+        v_v_coords = tk.BooleanVar(value=bool(vg.get("coords", False)))
+        v_v_error = tk.BooleanVar(value=bool(vg.get("error", True)))
+        v_v_rate = tk.StringVar(value=str(vg.get("rate", 0)))
+        tk.Checkbutton(f_voice, text="启用语音播报(离线·调系统语音)", variable=v_v_en, bg="#171a1f",
+                       fg="#e8eaed", activebackground="#171a1f", activeforeground="#e8eaed",
+                       selectcolor="#171a1f", font=("Microsoft YaHei UI", 9)).pack(anchor="w", **pad)
+        tk.Checkbutton(f_voice, text="播距离/方位(两点就绪自动播)", variable=v_v_result, bg="#171a1f",
+                       fg="#e8eaed", activebackground="#171a1f", activeforeground="#e8eaed",
+                       selectcolor="#171a1f", font=("Microsoft YaHei UI", 9)).pack(anchor="w", **pad)
+        tk.Checkbutton(f_voice, text="播自点/目标坐标", variable=v_v_coords, bg="#171a1f",
+                       fg="#e8eaed", activebackground="#171a1f", activeforeground="#e8eaed",
+                       selectcolor="#171a1f", font=("Microsoft YaHei UI", 9)).pack(anchor="w", **pad)
+        tk.Checkbutton(f_voice, text="识别失败时播报", variable=v_v_error, bg="#171a1f",
+                       fg="#e8eaed", activebackground="#171a1f", activeforeground="#e8eaed",
+                       selectcolor="#171a1f", font=("Microsoft YaHei UI", 9)).pack(anchor="w", **pad)
+        rate_f = tk.Frame(f_voice, bg="#171a1f")
+        rate_f.pack(fill="x", **pad)
+        tk.Label(rate_f, text="语速(-10~10)", bg="#171a1f", fg="#e8eaed", width=14, anchor="w",
+                 font=("Microsoft YaHei UI", 10)).pack(side="left")
+        tk.Entry(rate_f, textvariable=v_v_rate, bg="#1c2026", fg="#e8eaed", insertbackground="#fff",
+                 relief="flat", width=22).pack(side="left")
+        # 发音人(女声/男声):枚举系统已安装语音填下拉
+        voice_f = tk.Frame(f_voice, bg="#171a1f")
+        voice_f.pack(fill="x", **pad)
+        tk.Label(voice_f, text="发音人(男/女)", bg="#171a1f", fg="#e8eaed", width=14, anchor="w",
+                 font=("Microsoft YaHei UI", 10)).pack(side="left")
+        v_v_voice = tk.StringVar()
+        voice_map = {"系统默认": ""}
+        default_voice = vg.get("voice", "") or ""
+        selected_voice = "系统默认"
+        try:
+            for nm, g in list_install_voices():
+                lab = "%s · %s" % (g, nm)
+                voice_map[lab] = nm
+                if default_voice and default_voice == nm:
+                    selected_voice = lab
+        except Exception:
+            pass
+        v_voice_cb = ttk.Combobox(voice_f, textvariable=v_v_voice, state="readonly",
+                                  values=tuple(voice_map), width=22)
+        v_voice_cb.pack(side="left")
+        v_v_voice.set(selected_voice)
+        tk.Label(voice_f, text="女声/男声", bg="#171a1f", fg="#9aa0a6",
+                 font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(6, 0))
+        def try_voice():
+            def _play():
+                try:
+                    sel = voice_map.get(v_v_voice.get(), "")
+                    _av = VoiceAnnouncer(text_fn=title_voice,
+                                         voice_name=sel,
+                                         rate=v_v_rate.get() or 0)
+                    _av.speak("测试语音,距离三百零二米,方位十二点五度")
+                except Exception as e:
+                    messagebox.showerror("语音", "语音不可用: %s" % e)
+            threading.Thread(target=_play, daemon=True).start()
+        tk.Button(f_voice, text="试听(中文士兵)", bg="#34d399", fg="#07170f", relief="flat",
+                  font=("Microsoft YaHei UI", 9), command=try_voice).pack(**pad)
+        tk.Label(f_voice, text="发音在后台线程异步进行,不影响坐标/距离计算速度。",
+                 bg="#171a1f", fg="#9aa0a6", font=("Microsoft YaHei UI", 8)).pack(**pad)
+
         # ---- 瞄具参考线 ----
         rl = self.cfg.setdefault("reticle_line", {})
         f_line = tk.LabelFrame(win, text="瞄具参考线(用于对齐刻度)", bg="#171a1f", fg="#34d399",
@@ -1577,6 +1787,17 @@ class OverlayApp:
                 rl2["x_offset"] = int(v_xoff.get())
                 rl2["step_m"] = float(v_step.get())
                 rl2["res_height"] = int(v_res.get().split(":")[0])  # 下拉框值形如 "1600: 1600 (...)"
+                vg2 = self.cfg.setdefault("voice", {})
+                vg2["enabled"] = bool(v_v_en.get())
+                vg2["result"] = bool(v_v_result.get())
+                vg2["coords"] = bool(v_v_coords.get())
+                vg2["error"] = bool(v_v_error.get())
+                try:
+                    vg2["rate"] = int(v_v_rate.get())
+                except Exception:
+                    vg2["rate"] = 0
+                vg2["voice"] = voice_map.get(v_v_voice.get(), "")
+                self._init_voice()          # 应用语音开/关
                 save_config(self.cfg)
                 self.ref_line.refresh_geometry()
                 self._reload_terrain()          # 换地图/目录后重载高程包
