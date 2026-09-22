@@ -16,7 +16,7 @@
 | 入口 | 链接 |
 |---|---|
 | 🏷️ 下载页（全部版本） | https://github.com/Mark136880/coord-tool/releases |
-| ⬇️ 最新安装包直链 | [坐标距离计算-安装包.exe](https://github.com/Mark136880/coord-tool/releases/latest/download/坐标距离计算-安装包.exe) |
+| ⬇️ 最新安装包直链 | [CoordTool-Setup.exe](https://github.com/Mark136880/coord-tool/releases/latest/download/CoordTool-Setup.exe) |
 
 > 安装包内置便携版 OCR，**免装 Tesseract**，可全程离线运行。
 
