@@ -16,6 +16,7 @@ import math
 import json
 import queue
 import re
+import time
 import threading
 import ctypes
 import ctypes.wintypes as wintypes
@@ -31,8 +32,6 @@ except Exception:
 
 from PIL import ImageGrab, Image, ImageDraw, ImageEnhance, ImageOps, ImageTk
 import pytesseract
-
-import terrain as _terrain   # 读 .wdt 高程地形包(自点/目标处的海拔)
 
 if getattr(sys, "frozen", False):
     # 打包成 exe 后,__file__ 指向临时解压目录;配置必须放在 exe 同目录才能持久保存
@@ -68,12 +67,19 @@ DEFAULT_CONFIG = {
                      "ladder": True, "tick_px": 136, "x_offset": -370, "label_gap": 70,
                      "step_m": 35.0, "step_slope": -9.7,
                      "res_height": 0},   # 刻度基准:0=自动(按当前屏高度,不开缩放) / 1440 / 1600 / 1080 …
-    # 高程地形包(.wdt):查自点/目标海拔,按高度差修正发射刻度距离
-    "terrain": {"enabled": True, "map": "bakurani",
-                "packs_dir": r"terrain-packs\terrain-packs",   # 相对 exe 目录,便于整包分发
-                "correction": 1.0,      # 高度差修正系数(目标更高时需要更大刻度,系数为正)
-                "y_flip": True,         # 游戏 Y 与高度网格行是否反向
-                "unit_to_meter": 6.25}, # 游戏世界单位 -> 米的水平比例(从包内 coverage 推出)
+    # 语音播报:调 Windows 自带 SAPI,零依赖、离线。发音在后台线程,不影响计算/UI。
+    "voice": {"enabled": True,           # 总开关
+              "style": "soldier",        # 风格:soldier=中文士兵战场口令,empty=原样读
+              "result": True,            # 播最终结果(距离/方位)
+              "coords": False,           # 播自点/目标坐标
+              "error": True,             # 识别失败时播报
+              "rate": 0,                 # SAPI 语速(-10~10),默认 0 正常
+              "repeat": 1,               # 每条播报重复次数(1=不重复)
+              "gap": 0,                  # 重复之间的间隔(秒)
+              "volume": 100,             # 音量(0~100),默认 100 最大
+              "voice": ""},              # 发音人名(空=系统默认;可选女/男声)
+    # 设置窗口显示方式:stack=纵向堆叠(一次看完全部), tabs=面包页(顶部分段,窗口更小)
+    "settings": {"style": "stack"},
 }
 
 
@@ -90,7 +96,8 @@ def load_config():
             merged["region"] = {**DEFAULT_CONFIG["region"], **(cfg.get("region") or {})}
             merged["reticle_line"] = {**DEFAULT_CONFIG["reticle_line"],
                                       **(cfg.get("reticle_line") or {})}
-            merged["terrain"] = {**DEFAULT_CONFIG["terrain"], **(cfg.get("terrain") or {})}
+            merged["voice"] = {**DEFAULT_CONFIG["voice"], **(cfg.get("voice") or {})}
+            merged["settings"] = {**DEFAULT_CONFIG["settings"], **(cfg.get("settings") or {})}
             return merged
     return dict(DEFAULT_CONFIG)
 
@@ -199,13 +206,6 @@ def res_scale(cfg):
     if not rh:
         return 1.0
     return sh / float(rh)
-
-
-def resolve_packs_dir(p):
-    """地形包目录:相对路径以 exe/脚本所在目录为基准,保证换电脑分发不复写也能找到。"""
-    if not p:
-        return ""
-    return p if os.path.isabs(p) else os.path.join(APP_DIR, p)
 
 
 def grab_ladder_strip(cfg):
@@ -322,6 +322,122 @@ def calc(p1, p2, scale):
     if bearing < 0:
         bearing += 360
     return d_unit, d_meter, bearing
+
+
+# ============================================================
+# 语音播报:调 Windows 自带语音(零 Python 依赖、离线、打包体积不变)
+# ------------------------------------------------------------
+# speak() 只往队列塞一条消息,真正发音在后台线程做(SAPI/System.Speech),
+# 绝不阻塞 UI 线程,也不增加坐标/距离计算耗时(计算是同步的,语音是异步的)。
+# ============================================================
+class VoiceAnnouncer:
+    def __init__(self, text_fn=None, voice_name="", rate=0, repeat=1, gap=0.0, volume=100):
+        """text_fn(text) -> 最终播报词(可加风格前缀)。不给则原样播。
+        voice_name: 指定发音人(System.Speech 名称,空=系统默认);rate: 语速(-10~10)。
+        repeat: 每条消息重复播报次数(>=1);gap: 重复之间的间隔秒;volume: 音量(0~100)。"""
+        self.q = queue.Queue()
+        self._text_fn = text_fn or (lambda t: t)
+        self._voice_name = voice_name or ""
+        self._rate = rate
+        self._repeat = max(1, int(repeat))
+        self._gap = max(0.0, float(gap))
+        self._volume = max(0, min(100, int(volume)))
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        """后台线程:队列里逐条取出,按重复次数与间隔用系统语音发声。不进 UI 线程,不影响计算。"""
+        while True:
+            text = self.q.get()
+            if text is None:
+                break
+            for _ in range(self._repeat):
+                try:
+                    self._say(text)
+                except Exception:
+                    pass
+                if self._gap > 0 and self._repeat > 1:
+                    time.sleep(self._gap)
+
+    def _say(self, text):
+        if not text:
+            return
+        import subprocess
+        # 通过环境变量传文本,避开引号/中文转义问题;用 System.Speech 离线发声。
+        # 只占一个后台 daemon 线程,计算/UI 完全不受影响。
+        sel = ""
+        if self._voice_name:
+            # 语音名含引号/空格,用 SelectVoice 前先按名称匹配,失败自动回落默认
+            sel = ("try { $s.SelectVoice('%s') } catch {} ;" % self._voice_name.replace("'", "''"))
+        rate = "try { $s.Rate = %d } catch {} ;" % int(self._rate)
+        vol = "try { $s.Volume = %d } catch {} ;" % int(self._volume)
+        ps = ("Add-Type -AssemblyName System.Speech;"
+              "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+              + sel + rate + vol +
+              "$s.Speak($env:COORDVOICE)")
+        enc = os.environ.copy()
+        enc["COORDVOICE"] = self._text_fn(text)
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                       env=enc, creationflags=0x08000000,  # CREATE_NO_WINDOW
+                       timeout=20, check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def speak(self, text):
+        """非阻塞:只入队。返回立即,计算/UI 不受影响。"""
+        try:
+            self.q.put_nowait(text)
+        except Exception:
+            pass
+
+
+def list_install_voices():
+    """枚举系统已安装的语音,返回 [(发音人名, 性别 女/男/未知), ...]。
+    离线、单次调用;失败时返回空列表(仅影响发音人下拉,不影响其它功能)。"""
+    import subprocess
+    ps = ("Add-Type -AssemblyName System.Speech;"
+          "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+          "$s.GetInstalledVoices() | ForEach-Object { $a=$_.VoiceInfo; "
+          "Write-Output ($a.Name + '|' + $a.Gender) }")
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           capture_output=True, creationflags=0x08000000, timeout=15)
+    except Exception:
+        return []
+    # 中文系统控制台默认 GBK,直接 text=True 会 UnicodeDecodeError,这里先解码再容错
+    try:
+        raw = r.stdout.decode("utf-8")
+    except Exception:
+        try:
+            raw = r.stdout.decode("gbk")
+        except Exception:
+            raw = r.stdout.decode("utf-8", "ignore")
+    res = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if "|" not in line:
+            continue
+        nm, g = line.rsplit("|", 1)
+        nm = nm.strip()
+        if not nm:
+            continue
+        if "emale" in g:
+            gender = "女"
+        elif "ale" in g:
+            gender = "男"
+        else:
+            gender = "未知"
+        res.append((nm, gender))
+    return res
+
+
+def title_voice(text):
+    """中文士兵战场风格:用军事术语精简整句,去除单位罗嗦,醒目简洁。"""
+    if not text:
+        return text
+    s = text.strip()
+    # 常见句式的口水词去掉,换成战场口令口吻
+    s = s.replace("米，方位", "米,方位")
+    s = s.replace(" 米", "米").replace(" 度", "度")
+    return s
 
 
 # ============================================================
@@ -739,12 +855,6 @@ class OverlayApp:
         self._calib_win = None
         self.ladder = []            # 从屏幕上读到的刻度尺 [(y, 值), ...]
 
-        # 高程地形包:后台线程载入,不阻塞界面
-        tg = self.cfg.setdefault("terrain", {})
-        self.terrain_loader = (_terrain.TerrainLoader(resolve_packs_dir(tg.get("packs_dir")), tg.get("map"))
-                               if tg.get("enabled") else None)
-        self._last_alt = ""         # 上次显示的高程文本,用于去重提示
-
         # 全局快捷键:RegisterHotKey(无键盘钩子),回调统一转给 Tk 主线程
         self.hotkeys = HotkeyManager(lambda slot: self.wake_queue.put(("hotkey", slot)))
         self.hotkeys.start()
@@ -754,6 +864,10 @@ class OverlayApp:
         self.ref_line = ReferenceLine(self.root, cfg)
         if (cfg.get("reticle_line") or {}).get("enabled"):
             self.ref_line.show()
+
+        # 语音播报:后台线程发音,不阻塞计算/UI。只在总开关开启时才建队列。
+        self._last_spoken = ()      # 去重:同一 (距离,方位) 不重复播
+        self._init_voice()
 
         self._on_close = False
 
@@ -824,27 +938,7 @@ class OverlayApp:
         except Exception:
             pass
 
-    # ---------- 地图选择 / 超简模式 ----------
-    def _list_maps(self):
-        """从地形包目录扫描可选地图。"""
-        d = ((self.cfg.get("terrain") or {}).get("packs_dir") or "")
-        try:
-            return sorted(f[:-4] for f in os.listdir(d)
-                          if f.lower().endswith(".wdt") and not f.lower() == "config.json")
-        except Exception:
-            return []
-
-    def _on_map_pick(self, _e=None):
-        m = self.v_map.get()
-        if not m:
-            return
-        tg = self.cfg.setdefault("terrain", {})
-        tg["map"] = m.lower()
-        save_config(self.cfg)
-        self._reload_terrain()
-        self.refresh()
-        self._log("已切换到地图: %s" % m)
-
+    # ---------- 超简模式 ----------
     def _build_content(self, simple):
         """重建内容区(普通/超简)。always 创建全部 label 引用(超简时隐藏的不 pack,避免 refresh 崩)。"""
         bg = "#171a1f"
@@ -876,9 +970,7 @@ class OverlayApp:
             self._row_pts = None
             self.lbl_self = tk.Label(self._content, text="自点", bg=bg, fg=fg)
             self.lbl_target = tk.Label(self._content, text="目标", bg=bg, fg=fg)
-            self.lbl_alt = tk.Label(self._content, text="高程", bg=bg, fg=orange)
             self.lbl_status = tk.Label(self._content, text="就绪", bg=bg, fg=sub)
-            self._row_map = None
         else:
             # ---------- 标题行:标题 + 右侧快捷键 ----------
             self._row_title = tk.Frame(self._content, bg=bg)
@@ -907,39 +999,25 @@ class OverlayApp:
             tk.Frame(self._row_kpi, bg=divider, width=1, height=48).grid(
                 row=0, column=1, rowspan=2, padx=14, sticky="ns")
 
-            # ---------- 自点 / 目标(等宽小字) ----------
+            # ---------- 自点 / 目标(等宽小字,同排) ----------
             self._row_pts = tk.Frame(self._content, bg=bg)
             self._row_pts.pack(fill="x", padx=10, pady=(2, 2))
+            # 两列(自点/目标)均分整行,保证相邻两段间距一致
+            self._row_pts.columnconfigure(0, weight=1)
+            self._row_pts.columnconfigure(1, weight=1)
             self.lbl_self = tk.Label(self._row_pts, text="自点 --", bg=bg, fg=fg,
-                                     font=mono_small, anchor="w")
-            self.lbl_self.pack(side="left")
+                                     font=mono_small, anchor="center")
+            self.lbl_self.grid(row=0, column=0, sticky="w", ipadx=0)
             self.lbl_target = tk.Label(self._row_pts, text="目标 --", bg=bg, fg=fg,
-                                       font=mono_small, anchor="e")
-            self.lbl_target.pack(side="right")
+                                       font=mono_small, anchor="center")
+            self.lbl_target.grid(row=0, column=1)
 
-            # ---------- 状态行:高程徽标(左) + 状态文字(右) ----------
+            # ---------- 状态行(仅状态文字) ----------
             self._row_status = tk.Frame(self._content, bg=bg)
             self._row_status.pack(fill="x", padx=10, pady=(2, 2))
-            self.lbl_alt = tk.Label(self._row_status, text="Δ高 --", bg=badge_bg, fg=orange,
-                                    font=("Microsoft YaHei UI", 8, "bold"), padx=7, pady=1,
-                                    anchor="w")
-            self.lbl_alt.pack(side="left")
-            self.lbl_status = tk.Label(self._row_status, text="就绪", bg=bg, fg=sub,
-                                       font=("Microsoft YaHei UI", 9), anchor="w",
+            self.lbl_status = tk.Label(self._row_status, text="就绪", bg=bg, fg=sub, anchor="w",
                                        justify="left")
-            self.lbl_status.pack(side="left", padx=(8, 0))
-
-            # ---------- 地图行 ----------
-            tg = self.cfg.setdefault("terrain", {})
-            self._row_map = tk.Frame(self._content, bg=bg)
-            self._row_map.pack(fill="x", padx=10, pady=(2, 0))
-            tk.Label(self._row_map, text="地图", bg=bg, fg=fg,
-                     font=("Microsoft YaHei UI", 9)).pack(side="left")
-            self.v_map = tk.StringVar(value=tg.get("map", "bakurani"))
-            self.cb_map = ttk.Combobox(self._row_map, textvariable=self.v_map, state="readonly",
-                                       width=11, values=self._list_maps())
-            self.cb_map.pack(side="left", padx=(2, 8))
-            self.cb_map.bind("<<ComboboxSelected>>", self._on_map_pick)
+            self.lbl_status.pack(fill="x")
 
     def toggle_simple(self):
         """超简模式:只显示 距离/方位(并排一行);隐藏标题等其余行;刻度尺不受影响。"""
@@ -1082,10 +1160,14 @@ class OverlayApp:
         x, y, ok = read_coordinate(self.cfg, save_preview_to=preview)
         if not ok:
             self._log("识别失败")
+            if self.announcer is not None and self.cfg["voice"].get("error"):
+                self.announcer.speak("识别失败,请重试")
             return
         self._log(f"识别到 x={x} y={y}")
         if slot == "self":
             self.self_pos = (x, y)
+            if self.announcer is not None and self.cfg["voice"].get("coords"):
+                self.announcer.speak("自点,东%.2f北%.2f" % (x, y))
         else:
             self.target_pos = (x, y)
         # 距离/方位和刻度尺线立刻画出来(用的是内置实测刻度表,不用等识别),
@@ -1123,13 +1205,6 @@ class OverlayApp:
             self.ladder = []
         return self.ladder
 
-    def _reload_terrain(self):
-        """按当前配置重建高程包 loader(换地图/目录/启用状态后调用)。"""
-        self.terrain_loader = None
-        tg = self.cfg.setdefault("terrain", {})
-        if tg.get("enabled"):
-            self.terrain_loader = _terrain.TerrainLoader(resolve_packs_dir(tg.get("packs_dir")), tg.get("map"))
-
     def refresh(self):
         s = self.self_pos
         t = self.target_pos
@@ -1139,53 +1214,27 @@ class OverlayApp:
             d_unit, d_meter, bearing = calc(s, t, self.cfg["scale_m_per_unit"])
             self.lbl_bear.config(text="方位: %.1f°" % bearing)
 
-            # 高程地形:查自点/目标海拔,用高度差修正发射刻度距离
-            eff = d_meter                       # 默认 = 平面距离(保持原有行为)
-            tg = self.cfg.setdefault("terrain", {})
-            if tg.get("enabled"):
-                if self.terrain_loader is not None and self.terrain_loader.is_ready():
-                    try:
-                        flip = tg.get("y_flip", True)
-                        hs = self.terrain_loader.height_at(s[0], s[1], flip)
-                        ht = self.terrain_loader.height_at(t[0], t[1], flip)
-                    except Exception:
-                        hs = ht = None
-                    if hs is None or ht is None:
-                        self.lbl_alt.config(text="高程: --")
-                    else:
-                        dh = ht - hs                       # 目标 - 自点
-                        k = float(tg.get("correction", 1.0))
-                        # 护栏:高度差修正最多影响一档射程的一半,并钳制在刻度表范围内。
-                        # 未在游戏里校准前,原始海拔可能含大量哨兵值(0/65535),必须防飞。
-                        corr = k * dh
-                        cap = 0.5 * d_meter
-                        corr = max(-cap, min(cap, corr))
-                        eff = max(20.0, min(900.0, d_meter + corr))
-                        self.lbl_alt.config(text="高程: 自点%.0f 目标%.0f 差%+.0fm"
-                                             % (hs, ht, dh))
-                elif self.terrain_loader is not None:
-                    self.lbl_alt.config(text="高程: 加载中..." if not self.terrain_loader.error
-                                        else "高程: 包加载失败(%s)" % self.terrain_loader.error)
-                else:
-                    self.lbl_alt.config(text="高程: 未启用")
-            else:
-                self.lbl_alt.config(text="高程: --")
+            eff = d_meter                       # 平面距离
 
             self.lbl_dist.config(text="发射距离: %.0f 米" % eff)
             # 刻度尺上画出目标发射距离那格 + 上下最近两格(用实测刻度值)
             self.ref_line.set_target(eff, self.ladder)
             mid, hi, lo, _, _ = self.ref_line._tick_values(eff, self.ref_line._line_cfg())
-            if abs(eff - d_meter) > 1.0:
-                self._log("平面 %.0f 米 + 高度差修正 → 刻度 %.0f 米" % (d_meter, eff))
-            elif mid == round(eff):
+            if mid == round(eff):
                 self._log("目标 %.0f 米 -> 用 %dM 那格对准准星中心" % (eff, mid))
             else:
                 self._log("目标 %.0f 米 -> 在 %dM 和 %dM 之间,按绿线位置对准准星中心(约 %dM)"
                           % (eff, lo, hi, mid))
+
+            # 语音播报最终结果(非阻塞、同值去重):"距离X米方位X度"
+            if self.announcer is not None and (self.cfg["voice"].get("result")):
+                key = (round(eff), round(bearing * 10))
+                if key != self._last_spoken:
+                    self._last_spoken = key
+                    self.announcer.speak("距离%d米,方位%.1f度" % (round(eff), bearing))
         else:
             self.lbl_dist.config(text="距离: --")
             self.lbl_bear.config(text="方位: --")
-            self.lbl_alt.config(text="高程: --")
             self.ref_line.clear_target()
 
     def _log(self, msg):
@@ -1232,6 +1281,19 @@ class OverlayApp:
             t.after(ms, t.destroy)
         except Exception:
             pass
+
+    def _init_voice(self):
+        """按当前配置创建/停用语音播报器(开关从设置保存后调用)。"""
+        vc = self.cfg.get("voice") or {}
+        self.announcer = None           # 先停旧的(旧线程是 daemon,自然回收)
+        if vc.get("enabled"):
+            fn = None   # 目前只保留系统女声原样读(去掉了士兵口令风格)
+            self.announcer = VoiceAnnouncer(text_fn=fn,
+                                            voice_name=vc.get("voice", "") or "",
+                                            rate=vc.get("rate", 0) or 0,
+                                            repeat=vc.get("repeat", 1) or 1,
+                                            gap=vc.get("gap", 0) or 0,
+                                            volume=vc.get("volume", 100) or 100)
 
     def toggle_ref_line(self):
         rl = self.cfg.setdefault("reticle_line", {})
@@ -1426,6 +1488,69 @@ class OverlayApp:
         win.protocol("WM_DELETE_WINDOW", lambda: (self.stop_record(), win.destroy()))
         pad = dict(padx=10, pady=4)
 
+        # 显示方式:纵向堆叠(一次看完全部) / 面包页(顶部分段,窗口更小)
+        set_style = self.cfg.setdefault("settings", {}).get("style", "stack")
+
+        def set_style_save(st):
+            self.cfg["settings"]["style"] = st
+            try: save_config(self.cfg)
+            except Exception: pass
+            self.stop_record()
+            win.destroy()
+            self.open_settings()          # 重建窗口以生效
+
+        # 顶部:显示方式切换
+        topctl = tk.Frame(win, bg="#171a1f")
+        topctl.pack(fill="x", padx=10, pady=(8, 0))
+        tk.Label(topctl, text="显示方式", bg="#171a1f", fg="#e8eaed",
+                 font=("Microsoft YaHei UI", 10)).pack(side="left")
+        for lab, st in (("纵向堆叠", "stack"), ("面包页(小窗口)", "tabs")):
+            tk.Button(topctl, text=lab, command=lambda s=st: set_style_save(s),
+                      bg="#2e6655" if set_style == st else "#31363e",
+                      fg="#dcfce7" if set_style == st else "#cbd0d6",
+                      relief="flat", font=("Microsoft YaHei UI", 9),
+                      padx=10).pack(side="left", padx=4)
+
+        # 内容区(body) + 面包页分段容器
+        body = tk.Frame(win, bg="#171a1f")
+        pages = []                                   # [(标题, Frame)]
+        tabbar = tk.Frame(win, bg="#15181d")         # 面包页顶部按钮条
+
+        def seg(title):
+            """每个分组的容器;面包页模式下是一个页签。"""
+            f = tk.Frame(body, bg="#171a1f")
+            pages.append((title, f))
+            return f
+
+        def apply_layout(mode):
+            # 先重建面包页按钮条
+            for w in tabbar.winfo_children():
+                w.destroy()
+            if mode == "tabs":
+                for title, f in pages:
+                    tk.Button(tabbar, text=title, relief="flat",
+                              bg="#31363e", fg="#cbd0d6", activebackground="#2e6655",
+                              activeforeground="#dcfce7",
+                              font=("Microsoft YaHei UI", 9), padx=8, pady=1,
+                              command=lambda ff=f: show_page(ff)).pack(side="left")
+                tabbar.pack(fill="x", padx=10, pady=(6, 2))
+                # 默认显示第一页
+                if pages:
+                    show_page(pages[0][1])
+                body.pack(fill="both", expand=True)
+            else:
+                for _, f in pages:
+                    f.pack(fill="x", **pad)
+                body.pack(fill="both", expand=True)
+            win.update_idletasks()
+            win.geometry("")
+
+        def show_page(cur):
+            for _, f in pages:
+                f.pack_forget()
+            cur.pack(fill="x", **pad)
+            win.geometry("")
+
         def row(parent, label, var, hint):
             f = tk.Frame(parent, bg="#171a1f")
             f.pack(fill="x", **pad)
@@ -1459,61 +1584,131 @@ class OverlayApp:
         v_bottom = tk.StringVar(value=str(self.cfg["region"]["box_bottom"]))
         v_debug = tk.BooleanVar(value=self.cfg["debug_preview"])
 
-        hotkey_row(win, "自点快捷键", v_self)
-        hotkey_row(win, "目标快捷键", v_target)
-        hotkey_row(win, "校准快捷键", v_calib)
-        hotkey_row(win, "显隐快捷键", v_toggle)
-        tk.Label(win, text="点\"录制\"后直接按键盘组合键(如 F9 或 Ctrl+F9),再点\"保存\"生效", bg="#171a1f", fg="#9aa0a6",
+        # ---- 第1组: 快捷键与比例尺 ----
+        f_hot = seg("快捷键与比例尺")
+        hotkey_row(f_hot, "自点快捷键", v_self)
+        hotkey_row(f_hot, "目标快捷键", v_target)
+        hotkey_row(f_hot, "校准快捷键", v_calib)
+        hotkey_row(f_hot, "显隐快捷键", v_toggle)
+        tk.Label(f_hot, text="点\"录制\"后直接按键盘组合键(如 F9 或 Ctrl+F9),再点\"保存\"生效", bg="#171a1f", fg="#9aa0a6",
                  font=("Microsoft YaHei UI", 8)).pack(**pad)
-        tk.Label(win, text="也可手动输入 f8 / ctrl+f8;若与游戏冲突,建议用带 Ctrl 的组合键", bg="#171a1f", fg="#9aa0a6",
+        tk.Label(f_hot, text="也可手动输入 f8 / ctrl+f8;若与游戏冲突,建议用带 Ctrl 的组合键", bg="#171a1f", fg="#9aa0a6",
                  font=("Microsoft YaHei UI", 8)).pack(**pad)
-        tk.Label(win, text="显隐键用于显示/隐藏悬浮窗 —— 隐藏后只有它能叫回来,别改成会和游戏冲突的键",
+        tk.Label(f_hot, text="显隐键用于显示/隐藏悬浮窗 —— 隐藏后只有它能叫回来,别改成会和游戏冲突的键",
                  bg="#171a1f", fg="#ffb86c", font=("Microsoft YaHei UI", 8)).pack(**pad)
 
-        row(win, "1单位=多少米", v_scale, "")
+        row(f_hot, "1单位=多少米", v_scale, "")
 
-        # ---- 高程地形包 ----
-        tg = self.cfg.setdefault("terrain", {})
-        f_ter = tk.LabelFrame(win, text="高程地形包(高度差修正)", bg="#171a1f", fg="#34d399",
-                              font=("Microsoft YaHei UI", 9), bd=0)
-        f_ter.pack(fill="x", padx=8, pady=6)
-        v_t_en = tk.BooleanVar(value=bool(tg.get("enabled", True)))
-        v_t_map = tk.StringVar(value=tg.get("map", "bakurani"))
-        v_t_dir = tk.StringVar(value=tg.get("packs_dir", ""))
-        v_t_k = tk.StringVar(value=str(tg.get("correction", 1.0)))
-        v_t_flip = tk.BooleanVar(value=bool(tg.get("y_flip", True)))
-        tk.Checkbutton(f_ter, text="启用高程修正", variable=v_t_en, bg="#171a1f", fg="#e8eaed",
-                       activebackground="#171a1f", activeforeground="#e8eaed", selectcolor="#171a1f",
-                       font=("Microsoft YaHei UI", 9)).pack(anchor="w", **pad)
-
-        # 从包里扫出可选地图,做下拉选择
-        def list_maps(dirpath):
-            try:
-                return sorted(
-                    f[:-4] for f in os.listdir(dirpath)
-                    if f.lower().endswith(".wdt") and not f.lower() == "config.json")
-            except Exception:
-                return []
-        f_map = tk.Frame(f_ter, bg="#171a1f")
-        f_map.pack(fill="x", **pad)
-        tk.Label(f_map, text="地图", bg="#171a1f", fg="#e8eaed", width=14, anchor="w",
+        # ---- 语音播报 ----
+        vg = self.cfg.setdefault("voice", {})
+        f_voice = tk.LabelFrame(seg("语音"), text="语音播报", bg="#171a1f", fg="#34d399",
+                                font=("Microsoft YaHei UI", 9), bd=0)
+        f_voice.pack(fill="x", padx=8, pady=6)
+        v_v_en = tk.BooleanVar(value=bool(vg.get("enabled", True)))
+        v_v_result = tk.BooleanVar(value=bool(vg.get("result", True)))
+        v_v_coords = tk.BooleanVar(value=bool(vg.get("coords", False)))
+        v_v_error = tk.BooleanVar(value=bool(vg.get("error", True)))
+        v_v_rate = tk.StringVar(value=str(vg.get("rate", 0)))
+        tk.Checkbutton(f_voice, text="启用语音播报(离线·调系统语音)", variable=v_v_en, bg="#171a1f",
+                       fg="#e8eaed", activebackground="#171a1f", activeforeground="#e8eaed",
+                       selectcolor="#171a1f", font=("Microsoft YaHei UI", 9)).pack(anchor="w", **pad)
+        tk.Checkbutton(f_voice, text="播距离/方位(两点就绪自动播)", variable=v_v_result, bg="#171a1f",
+                       fg="#e8eaed", activebackground="#171a1f", activeforeground="#e8eaed",
+                       selectcolor="#171a1f", font=("Microsoft YaHei UI", 9)).pack(anchor="w", **pad)
+        tk.Checkbutton(f_voice, text="播自点/目标坐标", variable=v_v_coords, bg="#171a1f",
+                       fg="#e8eaed", activebackground="#171a1f", activeforeground="#e8eaed",
+                       selectcolor="#171a1f", font=("Microsoft YaHei UI", 9)).pack(anchor="w", **pad)
+        tk.Checkbutton(f_voice, text="识别失败时播报", variable=v_v_error, bg="#171a1f",
+                       fg="#e8eaed", activebackground="#171a1f", activeforeground="#e8eaed",
+                       selectcolor="#171a1f", font=("Microsoft YaHei UI", 9)).pack(anchor="w", **pad)
+        rate_f = tk.Frame(f_voice, bg="#171a1f")
+        rate_f.pack(fill="x", **pad)
+        tk.Label(rate_f, text="语速(-10~10)", bg="#171a1f", fg="#e8eaed", width=14, anchor="w",
                  font=("Microsoft YaHei UI", 10)).pack(side="left")
-        cmap = ttk.Combobox(f_map, textvariable=v_t_map, values=list_maps(v_t_dir.get()),
-                            state="readonly", width=20)
-        cmap.pack(side="left")
-
-        row(f_ter, "地形包目录", v_t_dir, "")
-        row(f_ter, "高度差系数", v_t_k, "")
-        tk.Checkbutton(f_ter, text="游戏Y反向(y_flip)", variable=v_t_flip, bg="#171a1f", fg="#e8eaed",
-                       activebackground="#171a1f", activeforeground="#e8eaed", selectcolor="#171a1f",
-                       font=("Microsoft YaHei UI", 9)).pack(anchor="w", **pad)
-        tk.Label(f_ter, text="目标更高时发射刻度比平面距离更大;系数=1 时直接 +高度差。\n"
-                   "y_flip={}. 填错会读到相反位置的海拔,发射有误就反一下。".format(tg.get("y_flip", True)),
-                 bg="#171a1f", fg="#9aa0a6", font=("Microsoft YaHei UI", 8), justify="left").pack(**pad)
+        tk.Entry(rate_f, textvariable=v_v_rate, bg="#1c2026", fg="#e8eaed", insertbackground="#fff",
+                 relief="flat", width=22).pack(side="left")
+        # 重复次数 / 间隔:用于结果播报多念叨几遍,避免误听
+        rep_gap_f = tk.Frame(f_voice, bg="#171a1f")
+        rep_gap_f.pack(fill="x", **pad)
+        v_v_repeat = tk.StringVar(value=str(vg.get("repeat", 1) or 1))
+        v_v_gap = tk.StringVar(value=str(vg.get("gap", 0) or 0))
+        tk.Label(rep_gap_f, text="重复次数", bg="#171a1f", fg="#e8eaed", width=14, anchor="w",
+                 font=("Microsoft YaHei UI", 10)).pack(side="left")
+        tk.Entry(rep_gap_f, textvariable=v_v_repeat, bg="#1c2026", fg="#e8eaed",
+                 insertbackground="#fff", relief="flat", width=6).pack(side="left")
+        tk.Label(rep_gap_f, text="间隔(秒)", bg="#171a1f", fg="#e8eaed",
+                 font=("Microsoft YaHei UI", 10)).pack(side="left", padx=(10, 0))
+        tk.Entry(rep_gap_f, textvariable=v_v_gap, bg="#1c2026", fg="#e8eaed",
+                 insertbackground="#fff", relief="flat", width=6).pack(side="left")
+        # 音量(0~100):增益/减小
+        vol_f = tk.Frame(f_voice, bg="#171a1f")
+        vol_f.pack(fill="x", **pad)
+        v_v_volume = tk.StringVar(value=str(vg.get("volume", 100) or 100))
+        tk.Label(vol_f, text="音量(0~100)", bg="#171a1f", fg="#e8eaed", width=14, anchor="w",
+                 font=("Microsoft YaHei UI", 10)).pack(side="left")
+        tk.Entry(vol_f, textvariable=v_v_volume, bg="#1c2026", fg="#e8eaed",
+                 insertbackground="#fff", relief="flat", width=6).pack(side="left")
+        voice_f = tk.Frame(f_voice, bg="#171a1f")
+        voice_f.pack(fill="x", **pad)
+        tk.Label(voice_f, text="系统女声", bg="#171a1f", fg="#e8eaed", width=14, anchor="w",
+                 font=("Microsoft YaHei UI", 10)).pack(side="left")
+        # 只保留系统已装的女声;无则用系统默认。风格固定原样读
+        lang_map = {}
+        lang_labels = []
+        try:
+            for nm, g in list_install_voices():
+                if g != "女":
+                    continue
+                lab = "系统女声 · %s" % nm
+                lang_map[lab] = ("normal", nm)
+                lang_labels.append(lab)
+        except Exception:
+            pass
+        if not lang_labels:
+            lang_labels.append("系统默认")
+            lang_map["系统默认"] = ("normal", "")
+        def _lang_selected():
+            for lab, (_st, nm) in lang_map.items():
+                if nm == (vg.get("voice", "") or ""):
+                    return lab
+            return lang_labels[0]
+        v_v_lang = tk.StringVar(value=_lang_selected())
+        v_voice_cb = ttk.Combobox(voice_f, textvariable=v_v_lang, state="readonly",
+                                  values=lang_labels, width=26)
+        v_voice_cb.pack(side="left")
+        def try_voice():
+            def _play():
+                try:
+                    st, nm = lang_map.get(v_v_lang.get(), ("normal", ""))
+                    fn = title_voice if st == "soldier" else None
+                    try:
+                        rep = max(1, int(v_v_repeat.get() or 1))
+                    except Exception:
+                        rep = 1
+                    try:
+                        gp = float(v_v_gap.get() or 0)
+                    except Exception:
+                        gp = 0.0
+                    try:
+                        vv = max(0, min(100, int(v_v_volume.get() or 100)))
+                    except Exception:
+                        vv = 100
+                    _av = VoiceAnnouncer(text_fn=fn,
+                                         voice_name=nm,
+                                         rate=v_v_rate.get() or 0,
+                                         repeat=rep, gap=gp, volume=vv)
+                    _av.speak("距离302米,方位12.5度")
+                except Exception as e:
+                    messagebox.showerror("语音", "语音不可用: %s" % e)
+            threading.Thread(target=_play, daemon=True).start()
+        tk.Button(f_voice, text="试听", bg="#34d399", fg="#07170f", relief="flat",
+                  font=("Microsoft YaHei UI", 9), command=try_voice).pack(**pad)
+        tk.Label(f_voice, text="发音在后台线程异步进行,不影响坐标/距离计算速度。",
+                 bg="#171a1f", fg="#9aa0a6", font=("Microsoft YaHei UI", 8)).pack(**pad)
 
         # ---- 瞄具参考线 ----
         rl = self.cfg.setdefault("reticle_line", {})
-        f_line = tk.LabelFrame(win, text="瞄具参考线(用于对齐刻度)", bg="#171a1f", fg="#34d399",
+        f_line = tk.LabelFrame(seg("瞄具参考线"), text="瞄具参考线(用于对齐刻度)", bg="#171a1f", fg="#34d399",
                                font=("Microsoft YaHei UI", 9), bd=0)
         f_line.pack(fill="x", padx=8, pady=6)
         v_line_y = tk.StringVar(value=str(rl.get("y", -1)))
@@ -1537,7 +1732,8 @@ class OverlayApp:
                                 values=[f"{k}: {res_map[k]}" for k in keys])
         v_res_cb.pack(side="left")
 
-        f_reg = tk.LabelFrame(win, text="OCR识别区域(相对鼠标的偏移像素)", bg="#171a1f", fg="#34d399",
+        f_ocr = seg("OCR识别")
+        f_reg = tk.LabelFrame(f_ocr, text="OCR识别区域(相对鼠标的偏移像素)", bg="#171a1f", fg="#34d399",
                               font=("Microsoft YaHei UI", 9), bd=0)
         f_reg.pack(fill="x", padx=8, pady=6)
         row(f_reg, "向左偏移 box_left", v_left, "")
@@ -1547,10 +1743,13 @@ class OverlayApp:
         tk.Label(f_reg, text="建议直接按校准键(默认F9)在弹出的窗口里拖数值套住文字,比手填省事",
                  bg="#171a1f", fg="#9aa0a6", font=("Microsoft YaHei UI", 8)).pack(**pad)
 
-        tk.Checkbutton(win, text="校准时的识别区域保存为预览图片 (_calib_preview.png)",
+        tk.Checkbutton(f_ocr, text="校准时的识别区域保存为预览图片 (_calib_preview.png)",
                        variable=v_debug, bg="#171a1f", fg="#e8eaed",
                        activebackground="#171a1f", activeforeground="#e8eaed",
                        selectcolor="#171a1f", font=("Microsoft YaHei UI", 9)).pack(anchor="w", **pad)
+
+        # 按所选显示方式排布内容
+        apply_layout(set_style)
 
         def save():
             try:
@@ -1565,21 +1764,39 @@ class OverlayApp:
                 self.cfg["region"]["box_right"] = int(v_right.get())
                 self.cfg["region"]["box_bottom"] = int(v_bottom.get())
                 self.cfg["debug_preview"] = v_debug.get()
-                tg2 = self.cfg.setdefault("terrain", {})
-                tg2["enabled"] = v_t_en.get()
-                tg2["map"] = v_t_map.get().strip().lower()
-                tg2["packs_dir"] = v_t_dir.get().strip()
-                tg2["correction"] = float(v_t_k.get())
-                tg2["y_flip"] = v_t_flip.get()
                 rl2 = self.cfg.setdefault("reticle_line", {})
                 rl2["y"] = int(v_line_y.get())
                 rl2["tick_px"] = max(20, int(v_tick_px.get()))
                 rl2["x_offset"] = int(v_xoff.get())
                 rl2["step_m"] = float(v_step.get())
                 rl2["res_height"] = int(v_res.get().split(":")[0])  # 下拉框值形如 "1600: 1600 (...)"
+                vg2 = self.cfg.setdefault("voice", {})
+                vg2["enabled"] = bool(v_v_en.get())
+                vg2["result"] = bool(v_v_result.get())
+                vg2["coords"] = bool(v_v_coords.get())
+                vg2["error"] = bool(v_v_error.get())
+                st, vm = lang_map.get(v_v_lang.get(), ("normal", ""))
+                vg2["style"] = st
+                vg2["voice"] = vm
+                try:
+                    vg2["rate"] = int(v_v_rate.get())
+                except Exception:
+                    vg2["rate"] = 0
+                try:
+                    vg2["repeat"] = max(1, int(v_v_repeat.get() or 1))
+                except Exception:
+                    vg2["repeat"] = 1
+                try:
+                    vg2["gap"] = max(0.0, float(v_v_gap.get() or 0))
+                except Exception:
+                    vg2["gap"] = 0
+                try:
+                    vg2["volume"] = max(0, min(100, int(v_v_volume.get() or 100)))
+                except Exception:
+                    vg2["volume"] = 100
+                self._init_voice()          # 应用语音开/关
                 save_config(self.cfg)
                 self.ref_line.refresh_geometry()
-                self._reload_terrain()          # 换地图/目录后重载高程包
                 ok, errors = self.register_hotkeys()
                 self.refresh()
                 if ok:
