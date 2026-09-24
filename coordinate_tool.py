@@ -30,8 +30,14 @@ except Exception:
     except Exception:
         pass
 
-from PIL import ImageGrab, Image, ImageDraw, ImageEnhance, ImageOps, ImageTk
+from PIL import ImageGrab, Image, ImageDraw, ImageEnhance, ImageOps, ImageTk, ImageChops
 import pytesseract
+
+# 应用图标(内嵌 base64 PNG,运行时不依赖外部文件)
+try:
+    from _icon import ICON_B64
+except Exception:
+    ICON_B64 = ""
 
 if getattr(sys, "frozen", False):
     # 打包成 exe 后,__file__ 指向临时解压目录;配置必须放在 exe 同目录才能持久保存
@@ -55,9 +61,11 @@ DEFAULT_CONFIG = {
     "hotkey_target": "f10",
     "hotkey_calibrate": "f9",
     "hotkey_toggle": "f7",         # 显示/隐藏悬浮窗(隐藏后只能靠它叫回来)
+    "hotkey_passthrough": "f6",    # 切换悬浮窗鼠标穿透(默认穿透,不挡游戏;切回交互才能点按钮)
+    "passthrough": True,           # 悬浮窗默认鼠标穿透:游戏中鼠标不会切入悬浮窗
     "scale_m_per_unit": 100.0,     # 1 坐标单位 = 多少米
     "region": {"box_left": 110, "box_top": 90, "box_right": 110, "box_bottom": 80},
-    "auto_admin": False,           # 默认不提权(热键改用 RegisterHotKey,已不需要管理员)
+    "auto_admin": True,            # 默认提权:游戏以管理员运行时,低权限热键会被系统隔离屏蔽
     "debug_preview": False,        # 为 True 时点击"校准"会弹出预览小窗
     "overlay": {"alpha": 0.92},
     # 屏幕上用于对齐瞄具刻度的参考线 + 幽灵刻度尺
@@ -117,6 +125,71 @@ def save_config(cfg):
     return CONFIG_FALLBACK
 
 
+# 全局缓存窗口图标(PhotoImage 必须保持引用,否则被回收后图标消失)
+_APP_ICON = None
+
+
+def apply_window_icon(win):
+    """给 Tk 窗口设置应用图标(内嵌 PNG),替代系统默认羽毛图标。"""
+    global _APP_ICON
+    if not ICON_B64:
+        return
+    try:
+        if _APP_ICON is None:
+            _APP_ICON = tk.PhotoImage(data=ICON_B64)
+        win.iconphoto(True, _APP_ICON)
+    except Exception:
+        pass
+
+
+def set_window_passthrough(win, on):
+    """设置/取消窗口鼠标穿透(WS_EX_TRANSPARENT)。
+
+    穿透后鼠标点击直接落到下层窗口,游戏中鼠标划过悬浮窗不会被拦截;
+    取消穿透后恢复可交互(能点按钮/拖拽)。
+    注意:只加 WS_EX_TRANSPARENT,绝不加 WS_EX_LAYERED —— Tk 的 -transparentcolor
+    已设过透明色键,重复设置会让窗口整个变透明看不见。
+    """
+    try:
+        GWL_EXSTYLE = -20
+        WS_EX_TRANSPARENT = 0x00000020
+        WS_EX_TOOLWINDOW = 0x00000080
+        GA_ROOT = 2
+        SWP_NOSIZE = 0x0001
+        SWP_NOMOVE = 0x0002
+        SWP_NOZORDER = 0x0004
+        SWP_FRAMECHANGED = 0x0020
+        u = ctypes.windll.user32
+        # 64 位下窗口句柄要按指针传,否则高 32 位被截断导致拿错窗口
+        u.GetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        u.GetWindowLongW.restype = ctypes.c_long
+        u.SetWindowLongW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_long]
+        u.SetWindowLongW.restype = ctypes.c_long
+        u.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        u.GetAncestor.restype = ctypes.c_void_p
+        u.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        u.SetWindowPos.restype = ctypes.c_int
+
+        # Tk 根窗口 winfo_id() 返回的是内层子窗口句柄,鼠标命中测试走的是顶层窗口,
+        # 只给子窗口加样式会不生效 —— 必须取到 GA_ROOT 顶层窗口一起设
+        child = win.winfo_id()
+        hwnds = [child]
+        top = u.GetAncestor(child, GA_ROOT)
+        if top and top != child:
+            hwnds.append(top)
+        for hwnd in hwnds:
+            ex = u.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            if on:
+                u.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW)
+            else:
+                u.SetWindowLongW(hwnd, GWL_EXSTYLE, (ex | WS_EX_TOOLWINDOW) & ~WS_EX_TRANSPARENT)
+            # 刷新窗口样式,让穿透立刻生效
+            u.SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED)
+    except Exception:
+        pass
+
+
 # ============================================================
 # 坐标识别(截屏 + OCR)
 # ============================================================
@@ -163,19 +236,52 @@ def parse_coords(text):
 def ocr_coordinate(img):
     """对截图做 OCR,返回 (x, y) 或 (None, None)。
 
-    坐标文字一般是"白色+深色描边",而背景可能是明暗不一的地图/提示框。
+    坐标文字是白色(带深色描边),而背景可能是明暗/颜色不一的地图。
     所以按顺序试几种预处理,哪个能读出完整的 x 和 y 就采用哪个:
-      1) 二值化 —— 只留亮像素,能把背景和旁边的干扰文字一起滤掉(最常用、最有效)
-      2) 自动对比度 —— 适合深色文字/浅色背景
-      3) 对比度增强 —— 兜底
+      1) 白字抠取 —— 坐标文字白色且 R/G/B 都高;浅蓝/浅绿地图底色至少一个通道低,
+                    用三通道都高才保留,能精准把白字和浅色地图分开(最贴合实际)
+      2) Otsu 自适应二值化 —— 按灰度分布自动分前景/背景,适配任意明暗底色
+      3) 反色二值化 —— 必要时把黑白反过来再认
+      4) 自动对比度 / 对比度增强 —— 兜底
     """
     w, h = img.size
     big = img.resize((w * 3, h * 3), Image.LANCZOS).convert("L")
     cfg = "--psm 11 -c tessedit_char_whitelist=0123456789.xyXY"
+    # 白字抠取:三个通道都高于阈值才保留(白字的描边虽暗,但字心是白的)。
+    # 浅蓝(如 180,220,230)/浅绿(如 180,230,170)背景至少有一个通道 ≤阈值 → 被滤掉。
+    wt = 190
+    lut_white = [255 if i > wt else 0 for i in range(256)]
+    r, g, b = img.convert("RGB").resize((w * 3, h * 3), Image.LANCZOS).split()
+    white_variant = ImageChops.multiply(
+        ImageChops.multiply(r.point(lut_white), g.point(lut_white)), b.point(lut_white))
+    # Otsu 自适应二值化:按实际灰度分布自动分前景/背景
+    try:
+        hist = big.histogram()
+        total = sum(hist)
+        sum_all = sum(i * hist[i] for i in range(256))
+        sum_bg, w_bg, best, max_var = 0, 0, 175, -1.0
+        for t in range(256):
+            w_bg += hist[t]
+            if w_bg == 0:
+                continue
+            w_fg = total - w_bg
+            if w_fg == 0:
+                break
+            sum_bg += t * hist[t]
+            mb = sum_bg / w_bg
+            mf = (sum_all - sum_bg) / w_fg
+            var = w_bg * w_fg * (mb - mf) * (mb - mf)
+            if var > max_var:
+                max_var, best = var, t
+        lut = [255 if i > best else 0 for i in range(256)]
+    except Exception:
+        lut = [255 if i > 175 else 0 for i in range(256)]
     variants = (
-        big.point(lambda p: 255 if p > 175 else 0),
-        ImageOps.autocontrast(big),
-        ImageEnhance.Contrast(big).enhance(2.0),
+        white_variant,                          # 白字抠取(坐标文字是白的,首选)
+        big.point(lut),                         # Otsu 自适应二值化
+        ImageOps.invert(big.point(lut)),        # 反色二值化
+        ImageOps.autocontrast(big),             # 自动对比度
+        ImageEnhance.Contrast(big).enhance(2.0),  # 对比度兜底
     )
     for v in variants:
         try:
@@ -842,9 +948,16 @@ class OverlayApp:
 
         self.root = tk.Tk()
         self.root.title("坐标距离计算")
+        apply_window_icon(self.root)
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", cfg["overlay"].get("alpha", 0.92))
+        # 鼠标穿透:默认开启,游戏中鼠标划过/点击悬浮窗不会切入;按 F6 切回交互模式点按钮
+        self.passthrough = bool(cfg.get("passthrough", True))
+        set_window_passthrough(self.root, self.passthrough)
+
+        # OCR 线程锁:同一时刻只允许一个坐标识别在后台跑,避免连按 F8/F9 抢 CPU
+        self._ocr_lock = threading.Lock()
 
         self._build_ui()
         self.root.after(60, self._drain_queue)
@@ -909,6 +1022,7 @@ class OverlayApp:
         # 初始位置:右上角
         sw = self.root.winfo_screenwidth()
         self.root.geometry(f"+{sw - 360}+120")
+        self._fix_width()          # 固定窗口宽度,防止测距后内容变宽把窗口往右撑开
 
         # 拖拽:对除按钮外的所有控件都绑定,支持在窗口任意处拖动
         self._bind_drag_with_children(self.frame)
@@ -954,16 +1068,18 @@ class OverlayApp:
         mono_big = ("Consolas", 14, "bold")
         for c in self._content.winfo_children():
             c.destroy()
+        self._lock_btns = []      # 内容重建,旧按钮已销毁,引用清空防累积
         if simple:
-            # KPI 单行:距离+方位并排靠左,间距约26px,去掉中间竖线;其余行隐藏
+            # KPI 单行:距离+方位并排靠左,间距约26px;右侧放紧凑锁按钮(切换穿透)
             r = tk.Frame(self._content, bg=bg)
             r.pack(fill="x", padx=10, pady=(8, 4))
             self.lbl_dist = tk.Label(r, text="距离: --", bg=bg, fg=green, anchor="w",
-                                     font=mono_big)
+                                     font=mono_big, width=14)
             self.lbl_dist.pack(side="left")
             self.lbl_bear = tk.Label(r, text="方位: --", bg=bg, fg=blue, anchor="w",
-                                     font=mono_big)
+                                     font=mono_big, width=12)
             self.lbl_bear.pack(side="left", padx=(26, 0))
+            self._mk_lock_btn(r, compact=True).pack(side="right")
             # 隐藏的行不参与布局,但对象仍创建(不 pack),让 refresh/_log 直接 config 也不会崩
             self._row_title = None
             self.lbl_hotkey = None
@@ -972,14 +1088,16 @@ class OverlayApp:
             self.lbl_target = tk.Label(self._content, text="目标", bg=bg, fg=fg)
             self.lbl_status = tk.Label(self._content, text="就绪", bg=bg, fg=sub)
         else:
-            # ---------- 标题行:标题 + 右侧快捷键 ----------
+            # ---------- 标题行:标题 + 右侧锁按钮 + 快捷键 ----------
             self._row_title = tk.Frame(self._content, bg=bg)
             self._row_title.pack(fill="x", padx=10, pady=(6, 4))
             tk.Label(self._row_title, text="坐标距离 / 方位", bg=bg, fg=title_green,
                      font=("Microsoft YaHei UI", 10, "bold"), anchor="w").pack(side="left")
+            # 锁按钮放最右(点击切换穿透),快捷键缩略串放它左边
+            self._mk_lock_btn(self._row_title).pack(side="right", padx=(0, 0))
             self.lbl_hotkey = tk.Label(self._row_title, text="", bg=bg, fg=sub,
                                        font=mono_small, anchor="e")
-            self.lbl_hotkey.pack(side="right")
+            self.lbl_hotkey.pack(side="right", padx=(0, 6))
 
             # ---------- KPI 单行:左距离 右方位,中间细竖线分隔 ----------
             self._row_kpi = tk.Frame(self._content, bg=bg)
@@ -989,12 +1107,12 @@ class OverlayApp:
             tk.Label(self._row_kpi, text="距离 DIST", bg=bg, fg=green,
                      font=("Microsoft YaHei UI", 8)).grid(row=0, column=0, sticky="w")
             self.lbl_dist = tk.Label(self._row_kpi, text="--", bg=bg, fg=green, anchor="w",
-                                     font=mono_big)
+                                     font=mono_big, width=14)
             self.lbl_dist.grid(row=1, column=0, sticky="w")
             tk.Label(self._row_kpi, text="方位 BEAR", bg=bg, fg=blue,
                      font=("Microsoft YaHei UI", 8)).grid(row=0, column=2, sticky="w")
             self.lbl_bear = tk.Label(self._row_kpi, text="--", bg=bg, fg=blue, anchor="w",
-                                     font=mono_big)
+                                     font=mono_big, width=12)
             self.lbl_bear.grid(row=1, column=2, sticky="w")
             tk.Frame(self._row_kpi, bg=divider, width=1, height=48).grid(
                 row=0, column=1, rowspan=2, padx=14, sticky="ns")
@@ -1016,8 +1134,30 @@ class OverlayApp:
             self._row_status = tk.Frame(self._content, bg=bg)
             self._row_status.pack(fill="x", padx=10, pady=(2, 2))
             self.lbl_status = tk.Label(self._row_status, text="就绪", bg=bg, fg=sub, anchor="w",
-                                       justify="left")
+                                       justify="left", wraplength=340)
             self.lbl_status.pack(fill="x")
+
+    def _fix_width(self):
+        """固定窗口宽度(普通360/超简280),避免测距后距离文字变长把窗口往右撑宽。
+
+        Tk 默认 shrink-to-fit,内容变化会自动重算几何;这里在内容重建后
+        显式设定宽度并锁定,宽度不再跟随内容变化。
+        """
+        try:
+            w = 300 if self.simple_mode else 360
+            self.root.update_idletasks()
+            h = max(40, self.root.winfo_reqheight())
+            # 窗口还没显示时 winfo_x/y 是 0,不能带上位置(会把窗口挪到左上角),
+            # 只设尺寸,位置保留 _build_ui 里设好的右上角初始值
+            if self.root.winfo_ismapped():
+                geo = "%dx%d+%d+%d" % (w, h, self.root.winfo_x(), self.root.winfo_y())
+            else:
+                geo = "%dx%d" % (w, h)
+            self.root.geometry(geo)
+            self.root.minsize(w, 40)
+            self.root.maxsize(w, self.root.winfo_screenheight())
+        except Exception:
+            pass
 
     def toggle_simple(self):
         """超简模式:只显示 距离/方位(并排一行);隐藏标题等其余行;刻度尺不受影响。"""
@@ -1025,6 +1165,7 @@ class OverlayApp:
         self._build_content(self.simple_mode)
         self._bind_drag_with_children(self._content)
         self.root.update_idletasks()
+        self._fix_width()          # 重建后重新锁宽,防内容变化撑宽窗口
         if self.simple_mode:
             self._log("超简模式:仅显示距离/方位(同排);刻度尺不受影响")
         else:
@@ -1036,14 +1177,16 @@ class OverlayApp:
         return [("self", self.cfg["hotkey_self"]),
                 ("target", self.cfg["hotkey_target"]),
                 ("calibrate", self.cfg.get("hotkey_calibrate", "f9")),
-                ("toggle", self.cfg.get("hotkey_toggle", "f7"))]
+                ("toggle", self.cfg.get("hotkey_toggle", "f7")),
+                ("passthrough", self.cfg.get("hotkey_passthrough", "f6"))]
 
     def register_hotkeys(self):
         """重新注册全局热键。返回 (是否全部成功, 错误说明列表)"""
         ok, errors = self.hotkeys.update(self.hotkey_specs())
         hk = ", ".join("%s=%s" % (n, self.cfg.get(k, d).upper()) for n, k, d in
                        (("自点", "hotkey_self", "f8"), ("目标", "hotkey_target", "f10"),
-                        ("校准", "hotkey_calibrate", "f9"), ("显隐", "hotkey_toggle", "f7")))
+                        ("校准", "hotkey_calibrate", "f9"), ("显隐", "hotkey_toggle", "f7"),
+                        ("穿透", "hotkey_passthrough", "f6")))
         # 把当前生效的快捷键显示在悬浮窗标题处,便于确认修改是否生效
         try:
             self.lbl_hotkey.config(text=hk.replace(", ", " "))
@@ -1132,6 +1275,24 @@ class OverlayApp:
                 kind, payload = self.wake_queue.get_nowait()
                 if kind == "hotkey":
                     self._on_hotkey(payload)
+                elif kind == "coord":
+                    slot, x, y, ok = payload
+                    if not ok:
+                        self._log("识别失败")
+                        if self.announcer is not None and self.cfg["voice"].get("error"):
+                            self.announcer.speak("识别失败,请重试")
+                        continue
+                    self._log(f"识别到 x={x} y={y}")
+                    if slot == "self":
+                        self.self_pos = (x, y)
+                        if self.announcer is not None and self.cfg["voice"].get("coords"):
+                            self.announcer.speak("自点,东%.2f北%.2f" % (x, y))
+                    else:
+                        self.target_pos = (x, y)
+                    # 距离/方位和刻度尺线立刻画出来(用的是内置实测刻度表,不用等识别),
+                    # 刻度尺读数丢到后台线程慢慢做,读完再补上 —— 这样按键是瞬间响应的
+                    self.refresh()
+                    self.start_ladder_read()
                 elif kind == "ladder":
                     # 后台读到的刻度尺回来了,补进显示
                     self.ladder = payload or []
@@ -1155,25 +1316,23 @@ class OverlayApp:
             # 显示/隐藏悬浮窗。这是隐藏后唯一能把它叫回来的入口
             self.toggle_panel()
             return
+        if slot == "passthrough":
+            self.toggle_passthrough()
+            return
         self._log("读取坐标中……")
         preview = os.path.join(APP_DIR, "_preview.png") if self.cfg["debug_preview"] else None
-        x, y, ok = read_coordinate(self.cfg, save_preview_to=preview)
-        if not ok:
-            self._log("识别失败")
-            if self.announcer is not None and self.cfg["voice"].get("error"):
-                self.announcer.speak("识别失败,请重试")
-            return
-        self._log(f"识别到 x={x} y={y}")
-        if slot == "self":
-            self.self_pos = (x, y)
-            if self.announcer is not None and self.cfg["voice"].get("coords"):
-                self.announcer.speak("自点,东%.2f北%.2f" % (x, y))
-        else:
-            self.target_pos = (x, y)
-        # 距离/方位和刻度尺线立刻画出来(用的是内置实测刻度表,不用等识别),
-        # 刻度尺读数丢到后台线程慢慢做,读完再补上 —— 这样按键是瞬间响应的
-        self.refresh()
-        self.start_ladder_read()
+        # OCR 丢后台线程跑,UI 立即响应不卡顿;结果经 wake_queue 回主线程更新
+        threading.Thread(target=self._ocr_worker,
+                         args=(slot, preview), daemon=True).start()
+
+    def _ocr_worker(self, slot, preview):
+        """后台线程:截屏+OCR。锁保证同一时刻只跑一个识别,避免抢 CPU/热键堆积。"""
+        with self._ocr_lock:
+            try:
+                x, y, ok = read_coordinate(self.cfg, save_preview_to=preview)
+            except Exception:
+                x, y, ok = None, None, False
+        self.wake_queue.put(("coord", (slot, x, y, ok)))
 
     def start_ladder_read(self):
         """后台读一次屏幕上的刻度尺。
@@ -1263,6 +1422,42 @@ class OverlayApp:
             self.root.withdraw()
             # 窗口是没边框的,隐藏后不会有任务栏图标,所以必须提示恢复键
             self._toast("悬浮窗已隐藏\n按 %s 可重新显示并关闭程序" % key)
+
+    def toggle_passthrough(self):
+        """切换悬浮窗鼠标穿透:穿透=不挡游戏鼠标;交互=可以点按钮/拖拽。"""
+        self.passthrough = not self.passthrough
+        set_window_passthrough(self.root, self.passthrough)
+        try:
+            self.cfg["passthrough"] = self.passthrough
+            save_config(self.cfg)
+        except Exception:
+            pass
+        # 同步锁按钮图标/文字(普通/简化各一个引用,重建后指向当前按钮)
+        for b in getattr(self, "_lock_btns", ()):
+            try:
+                b.config(text=self._lock_text(compact=getattr(b, "_lock_compact", False)))
+            except Exception:
+                pass
+        self._log("鼠标穿透: ON —— 游戏中鼠标不会切入悬浮窗" if self.passthrough
+                  else "鼠标穿透: OFF —— 可点按钮/拖拽(游戏中可能误点)")
+
+    def _lock_text(self, compact=False):
+        """锁按钮文字:穿透=锁住(不挡游戏);交互=开锁(可操作)。compact 只显示图标。"""
+        if compact:
+            return "🔒" if self.passthrough else "🔓"
+        return "🔒 穿透" if self.passthrough else "🔓 交互"
+
+    def _mk_lock_btn(self, parent, compact=False):
+        """右上角锁图标按钮,点击切换穿透模式。compact=True 时只显示图标(简化模式省空间)。"""
+        btn = tk.Button(parent, text=self._lock_text(compact=compact),
+                        command=self.toggle_passthrough, bg="#23272e", fg="#c7ccd4",
+                        activebackground="#31363e", activeforeground="#fff",
+                        relief="flat", font=("Microsoft YaHei UI", 9),
+                        bd=0, padx=4 if compact else 8, pady=1, cursor="hand2")
+        btn._lock_compact = compact
+        self._lock_btns = getattr(self, "_lock_btns", [])
+        self._lock_btns.append(btn)
+        return btn
 
     def _toast(self, text, ms=5000):
         """在屏幕角落弹一条会自动消失的提示(隐藏窗口后唯一的反馈)。"""
@@ -1354,6 +1549,7 @@ class OverlayApp:
         win = tk.Toplevel(self.root)
         self._calib_win = win
         win.title("校准 - 让红框套住坐标文字")
+        apply_window_icon(win)
         win.attributes("-topmost", True)
         win.configure(bg=bg)
 
@@ -1483,6 +1679,7 @@ class OverlayApp:
     def open_settings(self):
         win = tk.Toplevel(self.root)
         win.title("设置")
+        apply_window_icon(win)
         win.attributes("-topmost", True)
         win.configure(bg="#171a1f")
         win.protocol("WM_DELETE_WINDOW", lambda: (self.stop_record(), win.destroy()))
@@ -1577,6 +1774,7 @@ class OverlayApp:
         v_target = tk.StringVar(value=self.cfg["hotkey_target"])
         v_calib = tk.StringVar(value=self.cfg.get("hotkey_calibrate", "f9"))
         v_toggle = tk.StringVar(value=self.cfg.get("hotkey_toggle", "f7"))
+        v_pass = tk.StringVar(value=self.cfg.get("hotkey_passthrough", "f6"))
         v_scale = tk.StringVar(value=str(self.cfg["scale_m_per_unit"]))
         v_left = tk.StringVar(value=str(self.cfg["region"]["box_left"]))
         v_top = tk.StringVar(value=str(self.cfg["region"]["box_top"]))
@@ -1590,12 +1788,15 @@ class OverlayApp:
         hotkey_row(f_hot, "目标快捷键", v_target)
         hotkey_row(f_hot, "校准快捷键", v_calib)
         hotkey_row(f_hot, "显隐快捷键", v_toggle)
+        hotkey_row(f_hot, "穿透快捷键", v_pass)
         tk.Label(f_hot, text="点\"录制\"后直接按键盘组合键(如 F9 或 Ctrl+F9),再点\"保存\"生效", bg="#171a1f", fg="#9aa0a6",
                  font=("Microsoft YaHei UI", 8)).pack(**pad)
         tk.Label(f_hot, text="也可手动输入 f8 / ctrl+f8;若与游戏冲突,建议用带 Ctrl 的组合键", bg="#171a1f", fg="#9aa0a6",
                  font=("Microsoft YaHei UI", 8)).pack(**pad)
         tk.Label(f_hot, text="显隐键用于显示/隐藏悬浮窗 —— 隐藏后只有它能叫回来,别改成会和游戏冲突的键",
                  bg="#171a1f", fg="#ffb86c", font=("Microsoft YaHei UI", 8)).pack(**pad)
+        tk.Label(f_hot, text="穿透键切换鼠标穿透:ON=游戏中鼠标不切入悬浮窗(默认);OFF=可点按钮/拖拽",
+                 bg="#171a1f", fg="#9aa0a6", font=("Microsoft YaHei UI", 8)).pack(**pad)
 
         row(f_hot, "1单位=多少米", v_scale, "")
 
@@ -1758,6 +1959,7 @@ class OverlayApp:
                 self.cfg["hotkey_target"] = v_target.get().strip().lower()
                 self.cfg["hotkey_calibrate"] = v_calib.get().strip().lower()
                 self.cfg["hotkey_toggle"] = v_toggle.get().strip().lower()
+                self.cfg["hotkey_passthrough"] = v_pass.get().strip().lower()
                 self.cfg["scale_m_per_unit"] = float(v_scale.get())
                 self.cfg["region"]["box_left"] = int(v_left.get())
                 self.cfg["region"]["box_top"] = int(v_top.get())
